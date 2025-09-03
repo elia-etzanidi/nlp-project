@@ -7,10 +7,12 @@ authors = [
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
-    "numpy (>=2.3.2,<3.0.0)",
-    "nltk (>=3.9.1,<4.0.0)"
+    "numpy (==1.26.4)",
+    "nltk (>=3.9.1,<4.0.0)",
+    "spacy (==3.7.2)",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1.tar.gz"
 ]
 
 
