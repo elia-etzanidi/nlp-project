@@ -2,6 +2,8 @@ from typing import Dict, Callable
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 import random
+import unicodedata
+import re
 
 # ---- small helpers -----------------------------------------------------------
 
@@ -14,7 +16,14 @@ def set_seed(seed: int = 42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+torch.set_grad_enabled(False)
 set_seed(42)
+
+def clean(text: str) -> str:  # <-- added
+    x = unicodedata.normalize("NFKC", text)
+    x = re.sub(r"[ \t]+", " ", x)
+    x = re.sub(r"\s*\n\s*", " ", x).strip()
+    return x
 
 # ---- pipelines ---------------------------------------------------------------
 
@@ -25,7 +34,6 @@ def setup_pipelines() -> Dict[str, Callable]:
     """
 
     # 1) T5 grammar correction (fine-tuned)
-    # Good community model for GEC
     t5_gc_name = "vennify/t5-base-grammar-correction"
     t5_gc_tok = AutoTokenizer.from_pretrained(t5_gc_name)
     t5_gc = AutoModelForSeq2SeqLM.from_pretrained(t5_gc_name)
@@ -37,13 +45,45 @@ def setup_pipelines() -> Dict[str, Callable]:
     )
 
     def t5_reconstruction(text: str) -> str:
-        out = t5_gc_pipe(
-            text.strip(),
-            max_new_tokens=128,
-            do_sample=False,
-            num_beams=4
-        )[0]["generated_text"]
-        return out.strip()
+        x = clean(text)
+        # Split into sentences so each decode stays short & complete
+        sents = re.split(r"(?<=[.!?])\s+", x)
+        outputs = []
+
+        for s in sents:
+            s = s.strip()
+            if not s:
+                continue
+
+            # First pass (normal budget)
+            out = t5_gc_pipe(
+                s,
+                num_beams=6,
+                early_stopping=False,
+                no_repeat_ngram_size=3,
+                max_new_tokens=96,      # per-sentence budget
+                min_new_tokens=16,
+                length_penalty=1.05,
+                truncation=True
+            )[0]["generated_text"].strip()
+
+            # Fallback: if it looks truncated (no terminal punctuation),
+            # give it a bit more budget for this sentence only.
+            if not re.search(r"[.!?]['\"]?$", out) and len(s) > 80:
+                out = t5_gc_pipe(
+                    s,
+                    num_beams=8,
+                    early_stopping=False,
+                    no_repeat_ngram_size=3,
+                    max_new_tokens=144,   # slightly larger retry
+                    min_new_tokens=24,
+                    length_penalty=1.05,
+                    truncation=True
+                )[0]["generated_text"].strip()
+
+            outputs.append(out)
+
+        return " ".join(outputs)
 
     # 2) BART paraphrase (fine-tuned)
     bart_para_name = "eugenesiow/bart-paraphrase"
@@ -54,17 +94,21 @@ def setup_pipelines() -> Dict[str, Callable]:
     )
 
     def bart_reconstruction(text: str) -> str:
-        prompt = text.strip()
+        # Make BART do grammar itself (paraphrase + correct)
         out = bart_para(
-            prompt,
-            max_new_tokens=128,
-            do_sample=False,
-            num_beams=4
-        )[0]["generated_text"]
-        return out.strip()
+            clean(text),
+            num_beams=6,
+            early_stopping=False,
+            no_repeat_ngram_size=3,
+            max_new_tokens=256,
+            min_new_tokens=64,
+            length_penalty=1.05,
+            truncation=True
+        )[0]["generated_text"].strip()
+        return out
 
     # 3) FLAN-T5 for instruction-style “improve & correct”
-    flan_name = "google/flan-t5-base"
+    flan_name = "google/flan-t5-large"
     flan_tok = AutoTokenizer.from_pretrained(flan_name)
     flan = AutoModelForSeq2SeqLM.from_pretrained(flan_name)
     flan_pipe = pipeline(
@@ -75,18 +119,18 @@ def setup_pipelines() -> Dict[str, Callable]:
     )
 
     def flan_reconstruction(text: str) -> str:
-        prompt = (
-            "Improve clarity and grammar. Keep meaning and names. "
-            "Rewrite as a polished email paragraph:\n\n" + text.strip()
-        )
         out = flan_pipe(
-            prompt,
-            max_new_tokens=160,
-            do_sample=False,
-            num_beams=4
-        )[0]["generated_text"]
-        return out.strip()
-
+            clean(text),
+            num_beams=6,
+            early_stopping=False,
+            no_repeat_ngram_size=3,
+            max_new_tokens=256,
+            min_new_tokens=64,
+            length_penalty=1.05,
+            truncation=True
+        )[0]["generated_text"].strip()
+        return out
+    
     return {
         "t5_grammar": t5_reconstruction,
         "bart_paraphrase": bart_reconstruction,
