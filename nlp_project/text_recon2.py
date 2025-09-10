@@ -83,6 +83,13 @@ def rouge_l_recall(ref: str, hyp: str) -> float:
     lcs = dp[-1][-1]
     return lcs / max(1, len(ref_t))
 
+def _token_len(s: str) -> int:
+    return len(s.split())
+
+def _within_len_bounds(src: str, hyp: str, lo: float = 0.75, hi: float = 1.35) -> bool:
+    sl, hl = max(1, _token_len(src)), max(1, _token_len(hyp))
+    return (hl >= max(6, int(sl * lo))) and (hl <= int(sl * hi))   
+
 # ----------------------- models & utilities -----------------------------------
 
 @dataclass
@@ -161,30 +168,61 @@ def t5_gec(gec_pipe, text: str) -> str:
         outs.append(y if preserves_numbers(s, y) else s)
     return " ".join(outs)
 
-def paraphrase_pegasus(peg_pipe, text: str, num_return_sequences: int = 1) -> List[str]:
-    # whole paragraph; PEGASUS likes bigger chunks
-    res = peg_pipe(
-        clean(text),
-        num_beams=8,
-        num_return_sequences=num_return_sequences,
-        no_repeat_ngram_size=3,
-        max_new_tokens=256,
-        length_penalty=1.0,
-        truncation=True
-    )
-    return [r["generated_text"].strip() for r in res]
+def paraphrase_pegasus_sentencewise(peg_pipe, text: str) -> str:
+    if peg_pipe is None:
+        return text
+    outs = []
+    for s in sent_split(text):
+        # Keep PEGASUS within its ~60 token cap
+        try:
+            res = peg_pipe(
+                s,
+                num_beams=6,
+                do_sample=False,
+                no_repeat_ngram_size=3,
+                max_length=60,   # <-- important: respect model cap
+                min_length=8,    # keep something substantive
+                length_penalty=1.1,
+                truncation=True,
+            )[0]["generated_text"].strip()
+        except Exception:
+            res = s  # fail-safe: keep original sentence
 
-def paraphrase_bart(bart_pipe, text: str, num_return_sequences: int = 1) -> List[str]:
-    res = bart_pipe(
-        clean(text),
-        num_beams=8,
-        num_return_sequences=num_return_sequences,
-        no_repeat_ngram_size=3,
-        max_new_tokens=256,
-        length_penalty=1.0,
-        truncation=True
-    )
-    return [r["generated_text"].strip() for r in res]
+        # guards: keep numbers & reasonable length; otherwise fall back
+        def _token_len(x): return len(x.split())
+        def _within_len_bounds(src, hyp, lo=0.75, hi=1.35):
+            sl, hl = max(1, _token_len(src)), max(1, _token_len(hyp))
+            return (hl >= max(6, int(sl*lo))) and (hl <= int(sl*hi))
+
+        if not preserves_numbers(s, res) or not _within_len_bounds(s, res):
+            outs.append(s)
+        else:
+            outs.append(res)
+    return " ".join(outs)
+
+def paraphrase_bart_sentencewise(bart_pipe, text: str) -> str:
+    outs = []
+    for s in sent_split(text):
+        try:
+            y = bart_pipe(
+                s,
+                num_beams=8,
+                do_sample=False,
+                no_repeat_ngram_size=3,
+                max_new_tokens=min(128, max(32, int(len(s) * 1.4))),
+                min_new_tokens=max(8, int(len(s) * 0.5)),
+                length_penalty=1.15,
+                truncation=True,
+            )[0]["generated_text"].strip()
+        except Exception:
+            y = s
+        # safety guards: keep numbers & reasonable length
+        sl, hl = max(1, len(s.split())), max(1, len(y.split()))
+        if not preserves_numbers(s, y) or hl < max(6, int(sl*0.75)) or hl > int(sl*1.35):
+            outs.append(s)
+        else:
+            outs.append(y)
+    return " ".join(outs)
 
 def rewrite_flan(flan_pipe, text: str) -> str:
     outs = []
@@ -349,15 +387,10 @@ def masked_lm_synonym_swap(text: str, mlm, mlm_tok, sbert, ref_text: str) -> str
 # ----------------------- pipelines -------------------------------------------
 
 def pipeline_A(models: ModelBundle, text: str) -> str:
-    # LanguageTool -> T5-GEC -> PEGASUS -> optional synonym swap
     x0 = language_tool_fix(models.lt, text)
     x1 = t5_gec(models.gec_pipe, x0)
-    # single best paraphrase for determinism
-    cand = paraphrase_pegasus(models.peg_pipe, x1, num_return_sequences=1)[0]
-    if ENABLE_SYNONYM_SWAP:
-        cand2 = masked_lm_synonym_swap(cand, models.mlm, models.mlm_tok, models.sbert, x1)
-        return cand2
-    return cand
+    y  = paraphrase_pegasus_sentencewise(models.peg_pipe, x1)
+    return y
 
 def pipeline_B(models: ModelBundle, text: str) -> str:
     # T5-GEC -> FLAN rewrite (instructional)
@@ -366,20 +399,16 @@ def pipeline_B(models: ModelBundle, text: str) -> str:
     return x2
 
 def pipeline_C(models: ModelBundle, text: str) -> str:
-    # T5-GEC -> candidate pool (PEGASUS + BART) -> rerank
-    x1 = t5_gec(models.gec_pipe, text)
-    pegs = paraphrase_pegasus(models.peg_pipe, x1, num_return_sequences=4)
-    barts = paraphrase_bart(models.bart_pipe, x1, num_return_sequences=4)
-    cands = list({c.strip() for c in (pegs + barts) if c.strip()})
+    # Simple: Grammar fix -> BART paraphrase (sentence-wise)
+    x0 = language_tool_fix(models.lt, text)
+    x1 = t5_gec(models.gec_pipe, x0)
 
-    scored: List[Tuple[Scores, str]] = []
-    for c in cands:
-        sc = score_candidate(c, x1, models.lt, models.sbert, models.gpt2, models.gpt2_tok)
-        scored.append((sc, c))
+    y = paraphrase_bart_sentencewise(models.bart_pipe, x1)
 
-    scored.sort(key=lambda t: t[0].total, reverse=True)
-    best = scored[0][1] if scored else x1
-    return best
+    # Optional extra guard (keeps 1:1 sentence mapping with the GEC reference)
+    # y = enforce_sentence_count(x1, y)
+
+    return y
 
 # ----------------------- runner & comparison ----------------------------------
 
@@ -413,7 +442,7 @@ def reconstruct_with_all_pipelines(texts: Dict[str, Dict]) -> Dict[str, Dict]:
 
         pA = apply_pipeline("pipeline_A_gec→pegasus(+syn)", pipeline_A, models, original)
         pB = apply_pipeline("pipeline_B_gec→flan", pipeline_B, models, original)
-        pC = apply_pipeline("pipeline_C_gec→pool→rerank", pipeline_C, models, original)
+        pC = apply_pipeline("pipeline_C_gec→bart", pipeline_C, models, original)
 
         # attach metrics relative to gec_ref
         for p in [pA, pB, pC]:
