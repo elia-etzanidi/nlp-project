@@ -14,11 +14,13 @@ Shared helpers imported from util.py:
   set_seed, device_index, clean, sent_split, preserves_numbers, within_len_bounds
 """
 
-from typing import Dict, Callable, List
+from typing import Dict, Callable, List, Optional
 from dataclasses import dataclass
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import language_tool_python
 import torch, re
+
+from language_tool_python.utils import RateLimitError
 
 from util import (
     set_seed,
@@ -36,18 +38,18 @@ set_seed(42)
 # ----------------------- models ----------------------------------------------
 @dataclass
 class ModelBundle:
-    lt: language_tool_python.LanguageTool
+    lt: Optional[language_tool_python.LanguageTool]   # was: LanguageTool
     gec_pipe: Callable
     peg_pipe: Callable
     bart_pipe: Callable
     flan_pipe: Callable
 
 def load_models() -> ModelBundle:
-    # LanguageTool (use local if available; else public API)
+    # LanguageTool: try local; if unavailable, set None (don’t hit public API)
     try:
         lt = language_tool_python.LanguageTool("en-US")
     except Exception:
-        lt = language_tool_python.LanguageToolPublicAPI("en-US")
+        lt = None
 
     # T5-GEC
     t5_gc_name = "vennify/t5-base-grammar-correction"
@@ -74,10 +76,14 @@ def load_models() -> ModelBundle:
     return ModelBundle(lt, gec_pipe, peg_pipe, bart_pipe, flan_pipe)
 
 # ----------------------- core steps (no scoring) ------------------------------
-def language_tool_fix(lt: language_tool_python.LanguageTool, text: str) -> str:
+def language_tool_fix(lt: Optional[language_tool_python.LanguageTool], text: str) -> str:
     text = clean(text)
+    if lt is None:
+        return text
     try:
         return lt.correct(text)
+    except RateLimitError:
+        return text
     except Exception:
         return text
 
@@ -178,7 +184,7 @@ def pipeline_C(models: ModelBundle, text: str) -> str:
     x1 = t5_gec(models.gec_pipe, x0)
     return paraphrase_bart_sentencewise(models.bart_pipe, x1)
 
-# ----------------------- public API ------------------------------------------
+# ----------------------- API ------------------------------------------
 def reconstruct_with_all_pipelines(texts: Dict[str, Dict]) -> Dict[str, Dict]:
     """
     Returns per text_id:
@@ -245,3 +251,27 @@ if __name__ == "__main__":
                 print(res["reconstructed"])
             else:
                 print("FAILED:", res.get("error", "Unknown error"))
+
+    # --- auto-save to txt files (short names) ---
+    from pathlib import Path
+    outdir = Path("outputs")   # folder will be created automatically
+    outdir.mkdir(exist_ok=True)
+
+    # 1) save GEC reference per text as textN_gec.txt
+    for text_id, bundle in out.items():
+        gec_path = outdir / f"{text_id}_gec.txt"
+        with gec_path.open("w", encoding="utf-8") as f:
+            f.write(bundle["gec_reference"].strip())
+
+    # 2) save pipeline outputs as textN_pipeA/B/C.txt
+    name_map = {"pipeline_A": "pipeA", "pipeline_B": "pipeB", "pipeline_C": "pipeC"}
+    for text_id, bundle in out.items():
+        for key, suffix in name_map.items():
+            res = bundle[key]
+            path = outdir / f"{text_id}_{suffix}.txt"
+            with path.open("w", encoding="utf-8") as f:
+                if res["success"]:
+                    f.write(res["reconstructed"].strip())
+                else:
+                    f.write(f"FAILED: {res.get('error','Unknown error')}\n\nOriginal:\n{res['original']}")
+    print(f"\nSaved reconstructions (including GEC) in: {outdir.resolve()}")            
