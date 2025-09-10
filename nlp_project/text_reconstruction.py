@@ -1,234 +1,214 @@
-from typing import Dict, Callable, List, Tuple
+"""
+text_reconstruction.py
+----------------------
+Three sentence-by-sentence reconstruction pipelines (no scoring).
+
+Pipelines:
+- A: LanguageTool -> T5-GEC -> PEGASUS paraphrase (sentence-wise, length-capped)
+- B: T5-GEC -> FLAN-T5 rewrite (instructional, sentence-wise)
+- C: LanguageTool -> T5-GEC -> BART paraphrase (sentence-wise)
+
+Dependencies:
+  transformers, language-tool-python, torch
+Shared helpers imported from util.py:
+  set_seed, device_index, clean, sent_split, preserves_numbers, within_len_bounds
+"""
+
+from typing import Dict, Callable, List
+from dataclasses import dataclass
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
-import torch
-import random
-import unicodedata
-import re
+import language_tool_python
+import torch, re
 
-# ---- small helpers -----------------------------------------------------------
+from util import (
+    set_seed,
+    device_index,
+    clean,
+    sent_split,
+    preserves_numbers,
+    within_len_bounds,
+)
 
-def device():
-    return 0 if torch.cuda.is_available() else -1
-
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
+# ----------------------- init -------------------------------------------------
 torch.set_grad_enabled(False)
 set_seed(42)
 
-def clean(text: str) -> str:  # <-- added
-    x = unicodedata.normalize("NFKC", text)
-    x = re.sub(r"[ \t]+", " ", x)
-    x = re.sub(r"\s*\n\s*", " ", x).strip()
-    return x
+# ----------------------- models ----------------------------------------------
+@dataclass
+class ModelBundle:
+    lt: language_tool_python.LanguageTool
+    gec_pipe: Callable
+    peg_pipe: Callable
+    bart_pipe: Callable
+    flan_pipe: Callable
 
-def chunk_by_tokens(text: str, tokenizer, max_src_tokens: int = 448, overlap_tokens: int = 32) -> List[str]:
-    """
-    Split text into token chunks under max_src_tokens with a small overlap.
-    Avoids input truncation inside HF pipeline/generate.
-    """
-    text = clean(text)
-    tokens = tokenizer.encode(text, add_special_tokens=False)
-    chunks = []
-    i = 0
-    while i < len(tokens):
-        j = min(i + max_src_tokens, len(tokens))
-        chunk = tokenizer.decode(tokens[i:j], skip_special_tokens=True)
-        chunks.append(chunk.strip())
-        if j == len(tokens):
-            break
-        i = j - overlap_tokens  # overlap for context continuity
-        if i < 0:
-            i = 0
-    return chunks
+def load_models() -> ModelBundle:
+    # LanguageTool (use local if available; else public API)
+    try:
+        lt = language_tool_python.LanguageTool("en-US")
+    except Exception:
+        lt = language_tool_python.LanguageToolPublicAPI("en-US")
 
-def sent_split(x: str):
-    # Simple splitter; swap with spaCy if you like
-    sents = re.split(r"(?<=[.!?])\s+", x)
-    return [s.strip() for s in sents if s.strip()]
-
-def preserves_numbers(src: str, hyp: str) -> bool:
-    for n in re.findall(r"\b\d+(?:\.\d+)?\b", src):
-        if n not in hyp:
-            return False
-    return True
-
-# ---- pipelines ---------------------------------------------------------------
-
-def setup_pipelines() -> Dict[str, Callable]:
-    """
-    Setup three different NLP pipelines for text reconstruction
-    Returns: dict of pipeline callables
-    """
-
-    # 1) T5 grammar correction (fine-tuned)
+    # T5-GEC
     t5_gc_name = "vennify/t5-base-grammar-correction"
-    t5_gc_tok = AutoTokenizer.from_pretrained(t5_gc_name)
-    t5_gc = AutoModelForSeq2SeqLM.from_pretrained(t5_gc_name)
-    t5_gc_pipe = pipeline(
-        "text2text-generation",
-        model=t5_gc,
-        tokenizer=t5_gc_tok,
-        device=device()
-    )
+    t5_tok = AutoTokenizer.from_pretrained(t5_gc_name)
+    t5 = AutoModelForSeq2SeqLM.from_pretrained(t5_gc_name)
+    gec_pipe = pipeline("text2text-generation", model=t5, tokenizer=t5_tok, device=device_index())
 
-    def t5_reconstruction(text: str) -> str:
-        x = clean(text)
-        # Split into sentences so each decode stays short & complete
-        sents = re.split(r"(?<=[.!?])\s+", x)
-        outputs = []
+    # PEGASUS paraphrase (slow tokenizer to avoid Windows/tiktoken issues)
+    peg_name = "tuner007/pegasus_paraphrase"
+    peg_tok = AutoTokenizer.from_pretrained(peg_name, use_fast=False)
+    peg = AutoModelForSeq2SeqLM.from_pretrained(peg_name)
+    peg_pipe = pipeline("text2text-generation", model=peg, tokenizer=peg_tok, device=device_index())
 
-        for s in sents:
-            s = s.strip()
-            if not s:
-                continue
+    # BART paraphrase
+    bart_name = "eugenesiow/bart-paraphrase"
+    bart_pipe = pipeline("text2text-generation", model=bart_name, device=device_index())
 
-            # First pass (normal budget)
-            out = t5_gc_pipe(
-                s,
-                num_beams=6,
-                early_stopping=False,
-                no_repeat_ngram_size=3,
-                max_new_tokens=96,      # per-sentence budget
-                min_new_tokens=16,
-                length_penalty=1.05,
-                truncation=True
-            )[0]["generated_text"].strip()
-
-            # Fallback: if it looks truncated (no terminal punctuation),
-            # give it a bit more budget for this sentence only.
-            if not re.search(r"[.!?]['\"]?$", out) and len(s) > 80:
-                out = t5_gc_pipe(
-                    s,
-                    num_beams=8,
-                    early_stopping=False,
-                    no_repeat_ngram_size=3,
-                    max_new_tokens=144,   # slightly larger retry
-                    min_new_tokens=24,
-                    length_penalty=1.05,
-                    truncation=True
-                )[0]["generated_text"].strip()
-
-            outputs.append(out)
-
-        return " ".join(outputs)
-
-    # 2) BART paraphrase (fine-tuned)
-    bart_para_name = "eugenesiow/bart-paraphrase"
-    bart_para = pipeline(
-        "text2text-generation",
-        model=bart_para_name,
-        device=device()
-    )
-
-    def bart_reconstruction(text: str) -> str:
-        # Make BART do grammar itself (paraphrase + correct)
-        out = bart_para(
-            clean(text),
-            num_beams=6,
-            early_stopping=False,
-            no_repeat_ngram_size=3,
-            max_new_tokens=256,
-            min_new_tokens=64,
-            length_penalty=1.05,
-            truncation=True
-        )[0]["generated_text"].strip()
-        return out
-
-    # 3) FLAN-T5 for instruction-style “improve & correct”
+    # FLAN-T5 rewriter
     flan_name = "google/flan-t5-large"
     flan_tok = AutoTokenizer.from_pretrained(flan_name)
     flan = AutoModelForSeq2SeqLM.from_pretrained(flan_name)
-    flan_pipe = pipeline(
-        "text2text-generation",
-        model=flan,
-        tokenizer=flan_tok,
-        device=device()
-    )
+    flan_pipe = pipeline("text2text-generation", model=flan, tokenizer=flan_tok, device=device_index())
 
-    def flan_reconstruction(text: str) -> str:
-        """
-        Simple 'more synonyms' paraphraser (medium+ strength).
-        One pass per sentence; keeps entities/numbers; no T5 fallback.
-        """
-        sents = sent_split(text)
-        if not sents:
-            return clean(text)
+    return ModelBundle(lt, gec_pipe, peg_pipe, bart_pipe, flan_pipe)
 
-        out = []
-        for s in sents:
-            prompt = (
-                "Rewrite the sentence using noticeably different wording. "
-                "Use appropriate SYNONYMS for at least ~30% of the content words and vary the structure, "
-                "but preserve ALL facts and nuances. "
-                "Do NOT summarize or change meaning. "
-                "Keep names, numbers, dates, and technical terms exactly as in the original. "
-                "Return exactly ONE sentence.\n\n"
-                f"Sentence: {s}\nParaphrase:"
-            )
-
-            y = flan_pipe(
-                prompt,
-                num_beams=1,              # avoid beam-length bias
-                do_sample=True,           # enable creativity
-                temperature=0.95,         # push more variation
-                top_p=0.95,               # allow rarer synonyms
-                no_repeat_ngram_size=3,
-                max_new_tokens=min(256, max(48, int(len(s) * 1.7))),
-                min_new_tokens=22,
-                length_penalty=1.20,
-                early_stopping=False,
-            )[0]["generated_text"].strip()
-
-            # quick cleanup + sentence ending
-            y = re.sub(r"^\s*(Paraphrase:|Output:)\s*", "", y, flags=re.I).strip()
-            y = re.sub(r"^\(\d+\)\s*", "", y).strip()
-            if not re.search(r"[.!?]['\"]?$", y):
-                y += "."
-
-            # simple safety: if numbers changed, keep original
-            out.append(y if preserves_numbers(s, y) else s)
-
-        return " ".join(out)
-    
-    return {
-        "t5_grammar": t5_reconstruction,
-        "bart_paraphrase": bart_reconstruction,
-        "flan_improve": flan_reconstruction
-    }
-
-def apply_pipeline_reconstruction(text: str, pipeline_name: str, pipeline_func: Callable) -> Dict:
+# ----------------------- core steps (no scoring) ------------------------------
+def language_tool_fix(lt: language_tool_python.LanguageTool, text: str) -> str:
+    text = clean(text)
     try:
-        reconstructed = pipeline_func(text)
-        return {
-            "pipeline": pipeline_name,
-            "original": text,
-            "reconstructed": reconstructed,
-            "success": True
-        }
-    except Exception as e:
-        return {
-            "pipeline": pipeline_name,
-            "original": text,
-            "reconstructed": text,
-            "success": False,
-            "error": str(e)
-        }
+        return lt.correct(text)
+    except Exception:
+        return text
 
-def reconstruct_with_all_pipelines(texts: Dict) -> Dict[str, Dict]:
-    pipelines = setup_pipelines()
-    results = {}
+def t5_gec(gec_pipe, text: str) -> str:
+    """Grammar-only correction, sentence-wise."""
+    outs: List[str] = []
+    for s in sent_split(text):
+        y = gec_pipe(
+            s,
+            num_beams=6,
+            no_repeat_ngram_size=3,
+            max_new_tokens=96,
+            length_penalty=1.05,
+            truncation=True,
+        )[0]["generated_text"].strip()
+        outs.append(y if preserves_numbers(s, y) else s)
+    return " ".join(outs)
+
+def paraphrase_pegasus_sentencewise(peg_pipe, text: str) -> str:
+    """PEGASUS paraphrase per sentence; hard cap ~60 tokens to avoid warnings."""
+    outs: List[str] = []
+    for s in sent_split(text):
+        try:
+            y = peg_pipe(
+                s,
+                num_beams=6,
+                do_sample=False,
+                no_repeat_ngram_size=3,
+                max_length=60,   # respect pegasus cap
+                min_length=8,
+                length_penalty=1.1,
+                truncation=True,
+            )[0]["generated_text"].strip()
+        except Exception:
+            y = s
+        ok = preserves_numbers(s, y) and within_len_bounds(s, y, lo=0.75, hi=1.35)
+        outs.append(y if ok else s)
+    return " ".join(outs)
+
+def paraphrase_bart_sentencewise(bart_pipe, text: str) -> str:
+    """BART paraphrase per sentence; a bit more room than PEGASUS."""
+    outs: List[str] = []
+    for s in sent_split(text):
+        try:
+            y = bart_pipe(
+                s,
+                num_beams=8,
+                do_sample=False,
+                no_repeat_ngram_size=3,
+                max_new_tokens=min(128, max(32, int(len(s) * 1.4))),
+                min_new_tokens=max(8, int(len(s) * 0.5)),
+                length_penalty=1.15,
+                truncation=True,
+            )[0]["generated_text"].strip()
+        except Exception:
+            y = s
+        ok = preserves_numbers(s, y) and within_len_bounds(s, y, lo=0.75, hi=1.35)
+        outs.append(y if ok else s)
+    return " ".join(outs)
+
+def rewrite_flan(flan_pipe, text: str) -> str:
+    """FLAN rewriter per sentence with instruction for fluency + paraphrase."""
+    outs: List[str] = []
+    for s in sent_split(text):
+        prompt = (
+            "Rewrite the sentence to be fluent, natural English while preserving ALL meaning. "
+            "Vary the wording and structure. Do not summarize. Keep names and numbers unchanged.\n\n"
+            f"Sentence: {s}\nParaphrase:"
+        )
+        y = flan_pipe(
+            prompt,
+            do_sample=False,
+            num_beams=4,
+            no_repeat_ngram_size=3,
+            max_new_tokens=min(192, max(48, int(len(s) * 1.6))),
+            length_penalty=1.05,
+            truncation=True,
+        )[0]["generated_text"].strip()
+        y = re.sub(r"^\s*(Paraphrase:|Output:)\s*", "", y, flags=re.I).strip()
+        outs.append(y if preserves_numbers(s, y) else s)
+    return " ".join(outs)
+
+# ----------------------- pipelines -------------------------------------------
+def pipeline_A(models: ModelBundle, text: str) -> str:
+    """LT -> T5-GEC -> PEGASUS paraphrase (sentence-wise)."""
+    x0 = language_tool_fix(models.lt, text)
+    x1 = t5_gec(models.gec_pipe, x0)
+    return paraphrase_pegasus_sentencewise(models.peg_pipe, x1)
+
+def pipeline_B(models: ModelBundle, text: str) -> str:
+    """T5-GEC -> FLAN rewrite (sentence-wise)."""
+    x1 = t5_gec(models.gec_pipe, text)
+    return rewrite_flan(models.flan_pipe, x1)
+
+def pipeline_C(models: ModelBundle, text: str) -> str:
+    """LT -> T5-GEC -> BART paraphrase (sentence-wise)."""
+    x0 = language_tool_fix(models.lt, text)
+    x1 = t5_gec(models.gec_pipe, x0)
+    return paraphrase_bart_sentencewise(models.bart_pipe, x1)
+
+# ----------------------- public API ------------------------------------------
+def reconstruct_with_all_pipelines(texts: Dict[str, Dict]) -> Dict[str, Dict]:
+    """
+    Returns per text_id:
+      - 'gec_reference': grammar-only baseline
+      - 'pipeline_A'/'pipeline_B'/'pipeline_C': { pipeline, original, reconstructed, success, error? }
+    """
+    models = load_models()
+    results: Dict[str, Dict] = {}
     for text_id, text_data in texts.items():
-        if text_id.startswith("text"):
-            original_text = text_data["original"]
-            results[text_id] = {}
-            for name, fn in pipelines.items():
-                results[text_id][name] = apply_pipeline_reconstruction(original_text, name, fn)
+        if not text_id.startswith("text"):
+            continue
+        original = text_data["original"]
+        gec_ref = t5_gec(models.gec_pipe, language_tool_fix(models.lt, original))
+
+        def _apply(name, fn):
+            try:
+                y = fn(models, original)
+                return {"pipeline": name, "original": original, "reconstructed": y, "success": True}
+            except Exception as e:
+                return {"pipeline": name, "original": original, "reconstructed": original, "success": False, "error": str(e)}
+
+        results[text_id] = {
+            "gec_reference": gec_ref,
+            "pipeline_A": _apply("pipeline_A_gec→pegasus", pipeline_A),
+            "pipeline_B": _apply("pipeline_B_gec→flan",    pipeline_B),
+            "pipeline_C": _apply("pipeline_C_gec→bart",    pipeline_C),
+        }
     return results
 
+# ----------------------- run alone -------------------------------------------
 if __name__ == "__main__":
     texts = {
         "text1": {
@@ -248,15 +228,20 @@ if __name__ == "__main__":
             doctor still plan for the acknowledgments section edit before he sending again. Because I didn’t see that
             part final yet, or maybe I missed, I apologize if so. Overall, let us make sure all are safe and celebrate
             the outcome with strong coffee and future targets."""
-        }
+        },
     }
-    pipeline_results = reconstruct_with_all_pipelines(texts)
 
-    for text_id, results in pipeline_results.items():
-        print(f"\n{text_id.upper()}:")
-        for pipeline_name, result in results.items():
-            if result["success"]:
-                print(f"\n[{pipeline_name.upper()} RESULT]")
-                print(result["reconstructed"])
+    out = reconstruct_with_all_pipelines(texts)
+
+    # pretty print (no metrics)
+    for tid, bundle in out.items():
+        print("\n" + "="*80)
+        print(tid.upper())
+        print("- GEC reference:\n", bundle["gec_reference"])
+        for key in ["pipeline_A", "pipeline_B", "pipeline_C"]:
+            res = bundle[key]
+            print(f"\n[{res['pipeline'].upper()}]")
+            if res["success"]:
+                print(res["reconstructed"])
             else:
-                print(f"\n[{pipeline_name.upper()} FAILED] {result.get('error', 'Unknown error')}")
+                print("FAILED:", res.get("error", "Unknown error"))
