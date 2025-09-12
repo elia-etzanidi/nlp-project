@@ -129,18 +129,20 @@ def paraphrase_bart_sentencewise(bart_pipe, text: str) -> str:
     for s in sent_split(text):
         try:
             y = bart_pipe(
-                s,
-                num_beams=8,
-                do_sample=False,
+                f"paraphrase: {s}",
+                do_sample=True,
+                num_beams=1,        # ← important
+                top_p=0.92,
+                top_k=60,
+                temperature=0.95,
+                max_new_tokens=96,
+                min_new_tokens=8,
                 no_repeat_ngram_size=3,
-                max_new_tokens=min(128, max(32, int(len(s) * 1.4))),
-                min_new_tokens=max(8, int(len(s) * 0.5)),
-                length_penalty=1.15,
                 truncation=True,
             )[0]["generated_text"].strip()
         except Exception:
-            y = s
-        ok = preserves_numbers(s, y) and within_len_bounds(s, y, lo=0.75, hi=1.35)
+           y = re.sub(r'^\s*(?:paraphrase\s*[:\-–—]\s*)+', '', y, flags=re.I)
+        ok = preserves_numbers(s, y) and within_len_bounds(s, y, lo=0.6, hi=1.6)
         outs.append(y if ok else s)
     return " ".join(outs)
 
@@ -149,14 +151,15 @@ def rewrite_flan(flan_pipe, text: str) -> str:
     outs: List[str] = []
     for s in sent_split(text):
         prompt = (
-            "Rewrite the sentence to be fluent, natural English while preserving ALL meaning. "
-            "Vary the wording and structure. Do not summarize. Keep names and numbers unchanged.\n\n"
+            "Paraphrase the sentence so it reads like natural English while keeping the exact meaning. "
+            "Change the wording and structure substantially. Keep names and numbers unchanged. "
+            "Output only the rewritten sentence; no explanations.\n\n"
             f"Sentence: {s}\nParaphrase:"
         )
         y = flan_pipe(
             prompt,
-            do_sample=False,
-            num_beams=4,
+            do_sample=True, top_p=0.92,
+            num_beams=1,
             no_repeat_ngram_size=3,
             max_new_tokens=min(192, max(48, int(len(s) * 1.6))),
             length_penalty=1.05,

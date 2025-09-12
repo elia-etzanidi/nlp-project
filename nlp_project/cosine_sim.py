@@ -1,112 +1,108 @@
 """
-Phase 2 scoring: embedding-based similarity + PCA/t-SNE visualization.
+Simple embedding similarity + PCA/t-SNE.
 
-Reads files in a folder (default: ./outputs) with the naming:
-  textN_orig.txt      (REQUIRED)  -> original text
-  textN_pipeA.txt     (REQUIRED)  -> pipeline A output
-  textN_pipeB.txt     (REQUIRED)  -> pipeline B output
-  textN_pipeC.txt     (REQUIRED)  -> pipeline C output
-  textN_gec.txt       (OPTIONAL)  -> GEC reference (for extra context/plotting)
+Originals:
+  texts/text1.txt, texts/text2.txt, ...
 
-Computes:
-  - SentenceTransformer embeddings (all-MiniLM-L6-v2, 384-d)
-  - Cosine similarity: cos(orig, pipeA/B/C) per textN
-Saves:
-  - JSON with scores (if --outjson provided)
-  - PCA plot (embeddings_pca.png)
-  - t-SNE plot (embeddings_tsne.png)
-
-Click-to-run default: reads ./outputs and writes plots into ./outputs.
+Pipelines:
+  outputs/text1_pipeA.txt, outputs/text1_pipeB.txt, outputs/text1_pipeC.txt, ...
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
-import re
 import json
-import math
-import argparse
-
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
+from sentence_transformers import SentenceTransformer
 
-# You’ll need: pip install sentence-transformers scikit-learn matplotlib
-from sentence_transformers import SentenceTransformer, util as st_util
+# ---------- config (relative to this file) ----------
+SCRIPT_DIR  = Path(__file__).resolve().parent
+ORIG_DIR    = SCRIPT_DIR / "texts"
+OUTPUTS_DIR = SCRIPT_DIR / "outputs"
+MODEL_NAME  = "sentence-transformers/all-MiniLM-L6-v2"
+WRITE_JSON  = True
+MAKE_PLOTS  = True
+TSNE_PERPLEXITY = 5.0
 
-# ---------- file IO ----------
-RE_PAT = re.compile(r"^(text\d+?)_(orig|pipeA|pipeB|pipeC|gec)\.txt$")
+# ---------- tiny data loader ----------
+def load_data(orig_dir: Path, out_dir: Path) -> Dict[str, Dict[str, str]]:
+    """
+    Returns:
+      {
+        'text1': {'orig': '...', 'pipeA': '...', 'pipeB': '...', 'pipeC': '...'}, # pipes present only if files exist
+        'text2': {...},
+      }
+    """
+    data: Dict[str, Dict[str, str]] = {}
 
-def scan_folder(indir: str | Path) -> Dict[str, Dict[str, str]]:
-    p = Path(indir)
-    found: Dict[str, Dict[str, str]] = {}
-    for f in p.glob("*.txt"):
-        m = RE_PAT.match(f.name)
-        if not m:
+    # 1) Read any pipeline files present
+    for f in out_dir.glob("text*_pipe*.txt"):
+        stem = f.stem  # e.g., "text1_pipeA"
+        try:
+            tid, kind = stem.split("_", 1)  # ["text1", "pipeA"]
+        except ValueError:
+            # Skip unexpected names
             continue
-        tid, kind = m.group(1), m.group(2)
-        found.setdefault(tid, {})
-        found[tid][kind] = f.read_text(encoding="utf-8").strip()
-    return found
+        d = data.setdefault(tid, {})
+        d[kind] = f.read_text(encoding="utf-8").strip()
+
+    # 2) Read originals for any text id that had at least one pipeline file
+    for tid in list(data.keys()):
+        opath = orig_dir / f"{tid}.txt"  # <-- ORIGINAL READ HERE
+        if opath.exists():
+            data[tid]["orig"] = opath.read_text(encoding="utf-8").strip()
+        else:
+            data[tid]["__error__"] = f"Missing original: {opath}"
+
+    return data
 
 # ---------- embeddings + cosine ----------
 @dataclass
 class EmbeddingResult:
     text_id: str
-    vectors: Dict[str, np.ndarray]      # keys: 'orig', 'pipeA', 'pipeB', 'pipeC', optional 'gec'
-    cos_sim: Dict[str, float]           # keys: 'pipeA','pipeB','pipeC' vs 'orig'
-
-def embed_texts(model: SentenceTransformer, blobs: Dict[str, str]) -> Dict[str, np.ndarray]:
-    """
-    Embed each present string value into a vector (L2 normalized).
-    """
-    keys = [k for k in ["orig","pipeA","pipeB","pipeC","gec"] if k in blobs]
-    texts = [blobs[k] for k in keys]
-    embs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-    return {k: emb for k, emb in zip(keys, embs)}
+    vectors: Dict[str, np.ndarray]      # keys like 'orig', 'pipeA', 'pipeB', 'pipeC'
+    cos_sim: Dict[str, float]           # cosine(orig, pipeX)
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    # embeddings are normalized, so cosine = dot
+    # embeddings normalized, so cosine == dot
     return float(np.clip(np.dot(a, b), -1.0, 1.0))
 
-def score_folder(indir: str | Path, model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Tuple[List[EmbeddingResult], Dict]:
-    files = scan_folder(indir)
+def score(data: Dict[str, Dict[str, str]], model_name: str) -> Tuple[List[EmbeddingResult], Dict[str, Dict[str, float]]]:
     model = SentenceTransformer(model_name)
-
     results: List[EmbeddingResult] = []
-    summary: Dict[str, Dict[str, float]] = {}  # per text_id similarities
+    summary: Dict[str, Dict[str, float]] = {}
 
-    for tid, parts in sorted(files.items()):
-        # require original + all three pipes to produce a full row
-        missing = [k for k in ["orig","pipeA","pipeB","pipeC"] if k not in parts]
-        if missing:
-            summary[tid] = {"error": f"Missing required files: {', '.join(missing)}"}
+    for tid, parts in sorted(data.items()):
+        if "__error__" in parts:
+            summary[tid] = {"error": parts["__error__"]}
+            continue
+        if "orig" not in parts:
+            summary[tid] = {"error": "Missing original"}
             continue
 
-        vecs = embed_texts(model, parts)
-        cs = {
-            "pipeA": cosine(vecs["orig"], vecs["pipeA"]),
-            "pipeB": cosine(vecs["orig"], vecs["pipeB"]),
-            "pipeC": cosine(vecs["orig"], vecs["pipeC"]),
-        }
+        # Embed only what's present
+        keys = ["orig"] + [k for k in ["pipeA","pipeB","pipeC"] if k in parts]
+        texts = [parts[k] for k in keys]
+        embs = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+        vecs = {k: v for k, v in zip(keys, embs)}
 
+        # Cosine vs original
+        cs = {k: cosine(vecs["orig"], vecs[k]) for k in keys if k != "orig"}
         results.append(EmbeddingResult(text_id=tid, vectors=vecs, cos_sim=cs))
         summary[tid] = cs
 
     return results, summary
 
-# ---------- visualization ----------
-def _collect_points_for_plot(items: List[EmbeddingResult]) -> Tuple[np.ndarray, List[str]]:
-    """
-    Build a matrix of all points and labels for plotting.
-    Labels like: "text1_orig", "text1_pipeA", ...
-    """
+# ---------- plotting ----------
+def _collect_points_for_plot(items: List[EmbeddingResult]):
     rows: List[np.ndarray] = []
     labels: List[str] = []
     for r in items:
-        for key in ["orig","gec","pipeA","pipeB","pipeC"]:
+        for key in ["orig","pipeA","pipeB","pipeC"]:
             if key in r.vectors:
                 rows.append(r.vectors[key])
                 labels.append(f"{r.text_id}_{key}")
@@ -114,10 +110,8 @@ def _collect_points_for_plot(items: List[EmbeddingResult]) -> Tuple[np.ndarray, 
     return X, labels
 
 def plot_pca(X: np.ndarray, labels: List[str], outpath: Path):
-    if X.shape[0] == 0:
-        return
-    pca = PCA(n_components=2, random_state=42)
-    X2 = pca.fit_transform(X)
+    if X.shape[0] == 0: return
+    X2 = PCA(n_components=2, random_state=42).fit_transform(X)
     plt.figure()
     plt.scatter(X2[:,0], X2[:,1])
     for (x, y, lab) in zip(X2[:,0], X2[:,1], labels):
@@ -128,10 +122,9 @@ def plot_pca(X: np.ndarray, labels: List[str], outpath: Path):
     plt.close()
 
 def plot_tsne(X: np.ndarray, labels: List[str], outpath: Path, perplexity: float = 5.0):
-    if X.shape[0] == 0:
-        return
-    tsne = TSNE(n_components=2, perplexity=min(perplexity, max(2, X.shape[0]-1)), init="pca", random_state=42)
-    X2 = tsne.fit_transform(X)
+    if X.shape[0] == 0: return
+    p = min(perplexity, max(2, X.shape[0]-1))
+    X2 = TSNE(n_components=2, perplexity=p, init="pca", random_state=42).fit_transform(X)
     plt.figure()
     plt.scatter(X2[:,0], X2[:,1])
     for (x, y, lab) in zip(X2[:,0], X2[:,1], labels):
@@ -141,39 +134,47 @@ def plot_tsne(X: np.ndarray, labels: List[str], outpath: Path, perplexity: float
     plt.savefig(outpath, dpi=150)
     plt.close()
 
-# ---------- main ----------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Phase 2: Embedding similarity + PCA/t-SNE visualization")
-    parser.add_argument("--indir", type=str, default="outputs", help="Folder with textN_orig.txt, textN_pipeA/B/C.txt, optional textN_gec.txt")
-    parser.add_argument("--model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer model name")
-    parser.add_argument("--outjson", type=str, default="", help="Optional: path to write similarities JSON")
-    parser.add_argument("--no_plots", action="store_true", help="Disable PCA/t-SNE plot generation")
-    args = parser.parse_args()
+# ---------- run from VS Code ----------
+def main():
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Originals: {ORIG_DIR}")
+    print(f"Pipelines: {OUTPUTS_DIR}")
 
-    outdir = Path(args.indir)
+    data = load_data(ORIG_DIR, OUTPUTS_DIR)
 
-    results, summary = score_folder(outdir, model_name=args.model)
+    # Quick inventory so you see what was read
+    print("\n[Inventory]")
+    for tid, parts in sorted(data.items()):
+        present = [k for k in parts.keys() if not k.startswith("__")]
+        note = parts.get("__error__", "")
+        print(f"  {tid}: {sorted(present)}" + (f" | {note}" if note else ""))
 
-    # pretty print
+    results, summary = score(data, MODEL_NAME)
+
+    print("\n[Cosine similarities]")
     for tid in sorted(summary.keys()):
         row = summary[tid]
         if "error" in row:
-            print(f"{tid}: {row['error']}")
+            print(f"  {tid}: {row['error']}")
             continue
-        print(f"\n{tid}")
+        print(f"  {tid}:")
         for k in ["pipeA","pipeB","pipeC"]:
             if k in row:
-                print(f"  cosine(orig, {k}): {row[k]:.4f}")
+                print(f"    cosine(orig, {k}) = {row[k]:.4f}")
 
-    if args.outjson:
-        Path(args.outjson).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"\nSaved JSON to: {Path(args.outjson).resolve()}")
+    if WRITE_JSON:
+        (OUTPUTS_DIR / "similarities.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"\nSaved JSON -> { (OUTPUTS_DIR / 'similarities.json').resolve() }")
 
-    if not args.no_plots:
+    if MAKE_PLOTS:
         X, labels = _collect_points_for_plot(results)
         if X.shape[0] == 0:
             print("\nNo points to plot.")
         else:
-            plot_pca(X, labels, outdir / "embeddings_pca.png")
-            plot_tsne(X, labels, outdir / "embeddings_tsne.png")
-            print(f"\nSaved plots to:\n  { (outdir / 'embeddings_pca.png').resolve() }\n  { (outdir / 'embeddings_tsne.png').resolve() }")
+            plot_pca(X, labels, OUTPUTS_DIR / "embeddings_pca.png")
+            plot_tsne(X, labels, OUTPUTS_DIR / "embeddings_tsne.png", perplexity=TSNE_PERPLEXITY)
+            print(f"Saved plots ->\n  { (OUTPUTS_DIR / 'embeddings_pca.png').resolve() }\n  { (OUTPUTS_DIR / 'embeddings_tsne.png').resolve() }")
+
+if __name__ == "__main__":
+    # Run directly in VS Code (Run Python File / F5)
+    main()
