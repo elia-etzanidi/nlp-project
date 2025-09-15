@@ -1,3 +1,5 @@
+import os
+
 # -----------------------------
 # Synonym Automaton
 # -----------------------------
@@ -69,6 +71,11 @@ class SentenceAutomaton:
 if __name__ == "__main__":
     automaton = SentenceAutomaton()
 
+    # Make sure outputs folder exists inside nlp_project/
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Sentence 1
     original_1 = "In fact, I have received the message from the professor, to show me, this, a couple of days ago."
     synonyms_1 = {
         "received": ["got", "obtained"],
@@ -77,9 +84,14 @@ if __name__ == "__main__":
         "show": ["demonstrate", "display"],
         "couple": ["few", "pair"]
     }
-    print("\nFirst Sentence Processing:\n")
-    automaton.process_sentence(original_1, synonyms_1)
+    rewritten_1, _ = automaton.process_sentence(original_1, synonyms_1)
 
+    with open(os.path.join(output_dir, "sent1_og.txt"), "w", encoding="utf-8") as f:
+        f.write(original_1)
+    with open(os.path.join(output_dir, "sent1_out.txt"), "w", encoding="utf-8") as f:
+        f.write(rewritten_1)
+
+    # Sentence 2
     original_2 = "Because I didn’t see that part final yet, or maybe I missed, I apologize if so."
     synonyms_2 = {
         "didn’t": ["did not"],
@@ -90,5 +102,11 @@ if __name__ == "__main__":
         "missed": ["overlooked"],
         "apologize": ["am sorry"]
     }
-    print("\nSecond Sentence Processing:\n")
-    automaton.process_sentence(original_2, synonyms_2)
+    rewritten_2, _ = automaton.process_sentence(original_2, synonyms_2)
+
+    with open(os.path.join(output_dir, "sent2_og.txt"), "w", encoding="utf-8") as f:
+        f.write(original_2)
+    with open(os.path.join(output_dir, "sent2_out.txt"), "w", encoding="utf-8") as f:
+        f.write(rewritten_2)
+
+    print(f"\nSaved files in {output_dir}/")
