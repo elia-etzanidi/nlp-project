@@ -111,14 +111,12 @@ def shared_vocab(base, other) -> List[str]:
 def ensure_outdir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
-def save_similarity_report(sim_df: pd.DataFrame, path_txt: Path, path_csv: Path, label: str):
+def print_similarity_report(sim_df: pd.DataFrame, label: str):
     # Sort by similarity (ascending) to highlight biggest shifts first
     sim_df_sorted = sim_df.sort_values("cosine_to_ref").reset_index(drop=True)
-    with path_txt.open("w", encoding="utf-8") as f:
-        f.write(f"# Cosine similarity vs reference (lower = larger shift): {label}\\n")
-        for _, row in sim_df_sorted.iterrows():
-            f.write(f"{row['word']}\t{row['cosine_to_ref']:.4f}\\n")
-    sim_df_sorted.to_csv(path_csv, index=False, encoding="utf-8")
+    print(f"\n=== Cosine similarity vs reference ({label}) ===")
+    for _, row in sim_df_sorted.iterrows():
+        print(f"{row['word']}\t{row['cosine_to_ref']:.4f}")
 
 def plot_shifts_2d(
     ref_vecs: np.ndarray, sys_vecs: np.ndarray, words: List[str],
@@ -223,23 +221,23 @@ def main():
     else:
         sim_C = pd.DataFrame(columns=["word", "cosine_to_ref", "system"])
 
-    # Save reports
-    save_similarity_report(sim_A, args.outdir / "similarities_A.txt", args.outdir / "similarities_A.csv", "A")
-    save_similarity_report(sim_B, args.outdir / "similarities_B.txt", args.outdir / "similarities_B.csv", "B")
-    if C_model is not None and not sim_C.empty:
-        save_similarity_report(sim_C, args.outdir / "similarities_C.txt", args.outdir / "similarities_C.csv", "C")
+    # Print reports
+    print_similarity_report(sim_A, "A")
+    print_similarity_report(sim_B, "B")
+    if not sim_C.empty:
+        print_similarity_report(sim_C, "C")
 
-    # Summary file
-    summary_lines = []
+    # Summary statistics
+    print("\n=== Summary statistics ===")
     for label, df in [("A", sim_A), ("B", sim_B), ("C", sim_C)]:
         if df.empty:
             continue
-        summary_lines.append(f"System {label}: {len(df)} shared words with reference.")
-        summary_lines.append(f"  Mean cosine: {df['cosine_to_ref'].mean():.4f}")
-        summary_lines.append(f"  Median cosine: {df['cosine_to_ref'].median():.4f}")
-        summary_lines.append(f"  10 lowest-similarity words: {', '.join(df.nsmallest(10, 'cosine_to_ref')['word'].tolist())}")
-        summary_lines.append("")
-    (args.outdir / "summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+        print(f"System {label}: {len(df)} shared words with reference.")
+        print(f"  Mean cosine: {df['cosine_to_ref'].mean():.4f}")
+        print(f"  Median cosine: {df['cosine_to_ref'].median():.4f}")
+        print("  10 lowest-similarity words:",
+            ", ".join(df.nsmallest(10, 'cosine_to_ref')['word'].tolist()))
+        print("")
 
     # Prepare vectors for visualization (A and B only, as requested)
     def prepare_vectors_for_viz(sys_model, label: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
@@ -266,6 +264,10 @@ def main():
     refB, sysB, wordsB = prepare_vectors_for_viz(B_model, "B")
     plot_shifts_2d(refB, sysB, wordsB, method="pca",  outpath=args.outdir / "shift_pca_B.png",  title="Semantic Shifts vs Reference (B) - PCA", max_points=args.max_words_viz)
     plot_shifts_2d(refB, sysB, wordsB, method="tsne", outpath=args.outdir / "shift_tsne_B.png", title="Semantic Shifts vs Reference (B) - t-SNE", max_points=args.max_words_viz)
+
+    refC, sysC, wordsC = prepare_vectors_for_viz(C_model, "C")
+    plot_shifts_2d(refC, sysC, wordsC, method="pca", outpath=args.outdir / "shift_pca_C.png", title="Semantic Shifts vs Reference (C) - PCA", max_points=args.max_words_viz)
+    plot_shifts_2d(refC, sysC, wordsC, method="tsne", outpath=args.outdir / "shift_tsne_C.png", title="Semantic Shifts vs Reference (C) - t-SNE", max_points=args.max_words_viz)
 
     print("Done. Results written to", args.outdir, file=sys.stderr)
 

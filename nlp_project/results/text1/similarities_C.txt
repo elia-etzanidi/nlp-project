@@ -1,1 +1,0 @@
-# Cosine similarity vs reference (lower = larger shift): C\nshow	0.8094\nmessage	0.8273\nprofessor	0.8387\ni	0.8392\nin	0.8414\nall	0.8498\nas	0.8511\nto	0.8550\nfor	0.8576\nthe	0.8587\nof	0.8593\nthis	0.8609\nour	0.8615\nyou	0.8664\nit	0.8863\n
