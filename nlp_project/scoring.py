@@ -1,11 +1,10 @@
 """
-Phase 1 scoring (NO embeddings, NO LanguageTool).
+Phase 1 scoring.
 
-Reads reconstruction outputs from .txt files only (no calls into text_reconstruction.py).
+Reads reconstruction outputs from .txt files.
 
-Required filenames in the input directory (default: ./outputs):
-  textN_gec.txt        # REQUIRED reference (grammar-only correction)
-  textN_pipeA.txt
+Required filenames in the input directory:
+  textN_gec.txt
   textN_pipeB.txt
   textN_pipeC.txt
 """
@@ -20,7 +19,7 @@ import json
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ---- shared helpers ----------------------------------------------------------
+# ------------------------- shared helpers ---------------------------------
 from util import (
     torch_device,
     clean,
@@ -30,131 +29,195 @@ from util import (
     preserves_numbers,
 )
 
-# ----------------------- models for Phase 1 -----------------------------------
+# --------------------------- models ---------------------------------------
 @dataclass
 class Phase1Models:
     gpt2_tok: AutoTokenizer
     gpt2: AutoModelForCausalLM
 
-def load_phase1_models() -> Phase1Models:
-    gpt2_tok = AutoTokenizer.from_pretrained("gpt2")
-    gpt2 = AutoModelForCausalLM.from_pretrained("gpt2").to(torch_device())
-    return Phase1Models(gpt2_tok, gpt2)
+def load_phase1_models(model_name: str = "gpt2") -> Phase1Models:
+    """Load GPT-2 model and tokenizer for perplexity calculation."""
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name).to(torch_device())
+        return Phase1Models(tokenizer, model)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model {model_name}: {e}")
 
-# ----------------------- metrics (non-embedding) ------------------------------
-def gpt2_perplexity(model, tok, text: str, stride: int = 1024) -> float:
-    enc = tok(text, return_tensors="pt")
-    input_ids = enc.input_ids.to(model.device)
-    nlls: List[torch.Tensor] = []
+# ------------------------------ metrics ------------------------------------
+def gpt2_perplexity(model: AutoModelForCausalLM, tokenizer: AutoTokenizer, 
+                   text: str, stride: int = 1024) -> float:
+    """Calculate perplexity using GPT-2 model."""
+    if not text.strip():
+        return float('inf')
+    
+    encoded = tokenizer(text, return_tensors="pt")
+    input_ids = encoded.input_ids.to(model.device)
+    
+    neg_log_likelihoods: List[torch.Tensor] = []
+    
     for i in range(0, input_ids.size(1), stride):
-        begin, end = i, min(i + stride, input_ids.size(1))
-        trg_len = end - begin
-        ids_slice = input_ids[:, begin:end]
-        target_ids = ids_slice.clone()
-        target_ids[:, :-trg_len] = -100
+        begin_loc = i
+        end_loc = min(i + stride, input_ids.size(1))
+        target_len = end_loc - begin_loc
+        
+        input_slice = input_ids[:, begin_loc:end_loc]
+        target_ids = input_slice.clone()
+        target_ids[:, :-target_len] = -100
+        
         with torch.no_grad():
-            out = model(ids_slice, labels=target_ids)
-            nlls.append(out.loss * trg_len)
-    loss = torch.stack(nlls).sum() / input_ids.size(1)
-    return float(torch.exp(loss).item())
+            outputs = model(input_slice, labels=target_ids)
+            neg_log_likelihoods.append(outputs.loss * target_len)
+    
+    perplexity = torch.exp(torch.stack(neg_log_likelihoods).sum() / input_ids.size(1))
+    return float(perplexity.item())
 
-def score_one_output(gec_text: str, hyp: str, models: Phase1Models) -> Dict:
-    hyp = clean(hyp); ref = clean(gec_text)
+def score_one_output(reference_text: str, hypothesis_text: str, models: Phase1Models) -> Dict:
+    """Score a single pipeline output against the GEC reference."""
+    clean_hypothesis = clean(hypothesis_text)
+    clean_reference = clean(reference_text)
+    
     return {
-        "gpt2_ppl": round(gpt2_perplexity(models.gpt2, models.gpt2_tok, hyp), 2),
-        "rougeL_recall_vs_gec": round(rouge_l_recall(ref, hyp), 4),
-        "length_ratio": round(len(hyp.split()) / max(1, len(ref.split())), 3),
-        "sent_count_delta": len(sent_split(hyp)) - len(sent_split(ref)),
-        "distinct1": round(distinct_n(hyp, 1), 4),
-        "distinct2": round(distinct_n(hyp, 2), 4),
-        "numbers_preserved": int(preserves_numbers(ref, hyp)),
+        "gpt2_ppl": round(gpt2_perplexity(models.gpt2, models.gpt2_tok, clean_hypothesis), 2),
+        "rougeL_recall_vs_gec": round(rouge_l_recall(clean_reference, clean_hypothesis), 4),
+        "length_ratio": round(len(clean_hypothesis.split()) / max(1, len(clean_reference.split())), 3),
+        "sent_count_delta": len(sent_split(clean_hypothesis)) - len(sent_split(clean_reference)),
+        "distinct1": round(distinct_n(clean_hypothesis, 1), 4),
+        "distinct2": round(distinct_n(clean_hypothesis, 2), 4),
+        "numbers_preserved": int(preserves_numbers(clean_reference, clean_hypothesis)),
     }
 
 # ----------------------- file readers -----------------------------------------
-PIPE_SHORT = {"pipeA": "pipeline_A", "pipeB": "pipeline_B", "pipeC": "pipeline_C"}
+# Expected pipeline types (adjust as needed)
+EXPECTED_PIPELINES = {
+    "pipeA": "pipeline_A",
+    "pipeB": "pipeline_B", 
+    "pipeC": "pipeline_C"
+}
 
-def _parse_filename(fname: str) -> Tuple[str, str] | None:
+def _parse_filename(filename: str) -> Tuple[str, str] | None:
     """
-    Return (text_id, kind) where kind in {"pipeA","pipeB","pipeC","gec"}.
-    Files must be named like: text1_pipeA.txt, text1_gec.txt
+    Parse filename to extract text_id and pipeline type.
+    
+    Expected format: text1_pipeA.txt, text1_pipeB.txt, text1_pipeC.txt, text1_gec.txt
+    Returns (text_id, pipeline_type) or None if invalid.
     """
-    m = re.match(r"^(text\d+?)_(pipeA|pipeB|pipeC|gec)\.txt$", fname)
-    if not m:
-        return None
-    return m.group(1), m.group(2)
+    pattern = r"^(text\d+)_(pipeA|pipeB|pipeC|gec)\.txt$"
+    match = re.match(pattern, filename)
+    return (match.group(1), match.group(2)) if match else None
 
-def read_folder(indir: str | Path) -> Dict[str, Dict[str, str]]:
+def read_folder(input_dir: str | Path) -> Dict[str, Dict[str, str]]:
     """
-    Returns: { text_id: { 'gec': <str>, 'pipeA': <str>?, 'pipeB': <str>?, 'pipeC': <str>? } }
-    Only includes files that match the naming convention.
+    Read all valid text files from directory.
+    
+    Returns: {text_id: {'gec': content, 'pipeB': content, ...}}
     """
-    p = Path(indir)
-    store: Dict[str, Dict[str, str]] = {}
-    for f in p.glob("*.txt"):
-        parsed = _parse_filename(f.name)
+    directory = Path(input_dir)
+    if not directory.exists():
+        raise FileNotFoundError(f"Input directory not found: {directory}")
+    
+    files_by_text: Dict[str, Dict[str, str]] = {}
+    
+    for file_path in directory.glob("*.txt"):
+        parsed = _parse_filename(file_path.name)
         if not parsed:
             continue
-        text_id, kind = parsed
-        store.setdefault(text_id, {})
-        store[text_id][kind] = f.read_text(encoding="utf-8").strip()
-    return store
+            
+        text_id, pipeline_type = parsed
+        content = file_path.read_text(encoding="utf-8").strip()
+        
+        files_by_text.setdefault(text_id, {})
+        files_by_text[text_id][pipeline_type] = content
+    
+    return files_by_text
 
-# ----------------------- scoring from files -----------------------------------
-def score_reconstruction_folder(indir: str | Path) -> Dict[str, Dict]:
+# ----------------------------- scoring ------------------------------------------
+def score_reconstruction_folder(input_dir: str | Path) -> Dict[str, Dict]:
     """
+    Score all reconstruction outputs in a folder.
+    
     Requires textN_gec.txt to exist for each textN to be scored.
     """
     models = load_phase1_models()
-    files = read_folder(indir)
-    scored: Dict[str, Dict] = {}
+    files_data = read_folder(input_dir)
+    results: Dict[str, Dict] = {}
 
-    for tid, parts in sorted(files.items()):
-        ref = parts.get("gec", "").strip()
-        if not ref:
-            scored[tid] = {"error": f"Missing required file: {tid}_gec.txt", "skipped": True}
+    for text_id, file_contents in sorted(files_data.items()):
+        gec_reference = file_contents.get("gec", "").strip()
+        
+        if not gec_reference:
+            results[text_id] = {
+                "error": f"Missing required file: {text_id}_gec.txt", 
+                "skipped": True
+            }
             continue
 
-        per_text = {"gec_reference": ref}
-        for short, longname in PIPE_SHORT.items():
-            hyp = parts.get(short)
-            if not hyp:
-                per_text[longname] = {"success": False, "error": f"Missing file: {tid}_{short}.txt"}
+        text_results = {"gec_reference": gec_reference}
+        
+        for short_name, long_name in EXPECTED_PIPELINES.items():
+            pipeline_output = file_contents.get(short_name)
+            
+            if not pipeline_output:
+                text_results[long_name] = {
+                    "success": False, 
+                    "error": f"Missing file: {text_id}_{short_name}.txt"
+                }
                 continue
-            per_text[longname] = {
-                "pipeline": longname,
-                "metrics_phase1": score_one_output(ref, hyp, models),
+            
+            text_results[long_name] = {
+                "pipeline": long_name,
+                "metrics_phase1": score_one_output(gec_reference, pipeline_output, models),
             }
 
-        scored[tid] = per_text
+        results[text_id] = text_results
 
-    return scored
+    return results
 
-# ----------------------- run standalone --------------------------------------
+# ----------------------------- main ---------------------------------------------
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Score reconstructions from .txt files (GEC required).")
-    parser.add_argument("--indir", type=str, default="outputs", help="Directory with textN_gec.txt and textN_pipeA/B/C.txt")
-    parser.add_argument("--outjson", type=str, default="", help="Optional path to save JSON with scores.")
+    
+    parser = argparse.ArgumentParser(
+        description="Score text reconstruction outputs against GEC references."
+    )
+    parser.add_argument(
+        "--indir", 
+        type=str, 
+        default="outputs", 
+        help="Directory containing textN_gec.txt and pipeline output files"
+    )
+    parser.add_argument(
+        "--outjson", 
+        type=str, 
+        default="", 
+        help="Optional path to save results as JSON"
+    )
+    
     args = parser.parse_args()
 
-    scored = score_reconstruction_folder(args.indir)
+    try:
+        results = score_reconstruction_folder(args.indir)
+    except Exception as e:
+        print(f"Error processing folder: {e}")
+        exit(1)
 
-    for tid, bundle in scored.items():
+    # Print results
+    for text_id, text_data in results.items():
         print("\n" + "=" * 80)
-        print(tid.upper())
-        if bundle.get("skipped"):
-            print(bundle["error"])
+        print(text_id.upper())
+        
+        if text_data.get("skipped"):
+            print(text_data["error"])
             continue
-        print("- GEC reference:\n", bundle["gec_reference"])
-        for key in ["pipeline_A", "pipeline_B", "pipeline_C"]:
-            entry = bundle.get(key, {})
-            if not entry or not entry.get("metrics_phase1"):
-                print(f"\n[{key}] FAILED:", entry.get("error", "Unavailable"))
+            
+        for pipeline_name in EXPECTED_PIPELINES.values():
+            pipeline_data = text_data.get(pipeline_name, {})
+            
+            if not pipeline_data or not pipeline_data.get("metrics_phase1"):
+                error_msg = pipeline_data.get("error", "Unavailable")
+                print(f"\n[{pipeline_name}] FAILED: {error_msg}")
                 continue
-            print(f"\n[{entry['pipeline'].upper()}]")
-            for k, v in entry["metrics_phase1"].items():
-                print(f"  {k}: {v}")
-
-    if args.outjson:
-        Path(args.outjson).write_text(json.dumps(scored, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"\nSaved JSON to: {Path(args.outjson).resolve()}")
+            
+            print(f"\n[{pipeline_data['pipeline'].upper()}]")
+            for metric_name, metric_value in pipeline_data["metrics_phase1"].items():
+                print(f"  {metric_name}: {metric_value}")
