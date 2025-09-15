@@ -1,15 +1,12 @@
 """
-text_reconstruction.py
-----------------------
-Three sentence-by-sentence reconstruction pipelines (no scoring).
-
 Pipelines:
 - A: LanguageTool -> T5-GEC -> PEGASUS paraphrase (sentence-wise, length-capped)
-- B: T5-GEC -> FLAN-T5 rewrite (instructional, sentence-wise)
+- B: T5-GEC -> FLAN-T5 rewrite (sentence-wise)
 - C: LanguageTool -> T5-GEC -> BART paraphrase (sentence-wise)
 
 Dependencies:
   transformers, language-tool-python, torch
+
 Shared helpers imported from util.py:
   set_seed, device_index, clean, sent_split, preserves_numbers, within_len_bounds
 """
@@ -19,7 +16,6 @@ from dataclasses import dataclass
 from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import language_tool_python
 import torch, re
-
 from language_tool_python.utils import RateLimitError
 
 from util import (
@@ -38,14 +34,14 @@ set_seed(42)
 # ----------------------- models ----------------------------------------------
 @dataclass
 class ModelBundle:
-    lt: Optional[language_tool_python.LanguageTool]   # was: LanguageTool
+    lt: Optional[language_tool_python.LanguageTool]
     gec_pipe: Callable
-    peg_pipe: Callable
+    pegasus_pipe: Callable
     bart_pipe: Callable
     flan_pipe: Callable
 
 def load_models() -> ModelBundle:
-    # LanguageTool: try local; if unavailable, set None (don’t hit public API)
+    # LanguageTool: try local; if unavailable, set None (don't hit public API)
     try:
         lt = language_tool_python.LanguageTool("en-US")
     except Exception:
@@ -57,11 +53,11 @@ def load_models() -> ModelBundle:
     t5 = AutoModelForSeq2SeqLM.from_pretrained(t5_gc_name)
     gec_pipe = pipeline("text2text-generation", model=t5, tokenizer=t5_tok, device=device_index())
 
-    # PEGASUS paraphrase (slow tokenizer to avoid Windows/tiktoken issues)
-    peg_name = "tuner007/pegasus_paraphrase"
-    peg_tok = AutoTokenizer.from_pretrained(peg_name, use_fast=False)
-    peg = AutoModelForSeq2SeqLM.from_pretrained(peg_name)
-    peg_pipe = pipeline("text2text-generation", model=peg, tokenizer=peg_tok, device=device_index())
+    # PEGASUS paraphrase
+    pegasus_name = "tuner007/pegasus_paraphrase"
+    pegasus_tok = AutoTokenizer.from_pretrained(pegasus_name, use_fast=False)
+    pegasus_model = AutoModelForSeq2SeqLM.from_pretrained(pegasus_name)
+    pegasus_pipe = pipeline("text2text-generation", model=pegasus_model, tokenizer=pegasus_tok, device=device_index())
 
     # BART paraphrase
     bart_name = "eugenesiow/bart-paraphrase"
@@ -70,12 +66,12 @@ def load_models() -> ModelBundle:
     # FLAN-T5 rewriter
     flan_name = "google/flan-t5-large"
     flan_tok = AutoTokenizer.from_pretrained(flan_name)
-    flan = AutoModelForSeq2SeqLM.from_pretrained(flan_name)
-    flan_pipe = pipeline("text2text-generation", model=flan, tokenizer=flan_tok, device=device_index())
+    flan_model = AutoModelForSeq2SeqLM.from_pretrained(flan_name)
+    flan_pipe = pipeline("text2text-generation", model=flan_model, tokenizer=flan_tok, device=device_index())
 
-    return ModelBundle(lt, gec_pipe, peg_pipe, bart_pipe, flan_pipe)
+    return ModelBundle(lt, gec_pipe, pegasus_pipe, bart_pipe, flan_pipe)
 
-# ----------------------- core steps (no scoring) ------------------------------
+# ----------------------- core steps ------------------------------
 def language_tool_fix(lt: Optional[language_tool_python.LanguageTool], text: str) -> str:
     text = clean(text)
     if lt is None:
@@ -102,36 +98,36 @@ def t5_gec(gec_pipe, text: str) -> str:
         outs.append(y if preserves_numbers(s, y) else s)
     return " ".join(outs)
 
-def paraphrase_pegasus_sentencewise(peg_pipe, text: str) -> str:
+def paraphrase_pegasus_sentencewise(pegasus_pipe, text: str) -> str:
     """PEGASUS paraphrase per sentence; hard cap ~60 tokens to avoid warnings."""
     outs: List[str] = []
     for s in sent_split(text):
         try:
-            y = peg_pipe(
+            y = pegasus_pipe(
                 s,
                 num_beams=6,
                 do_sample=False,
                 no_repeat_ngram_size=3,
-                max_length=60,   # respect pegasus cap
+                max_length=60,
                 min_length=8,
                 length_penalty=1.1,
                 truncation=True,
             )[0]["generated_text"].strip()
         except Exception:
-            y = s
+            y = s # fallback to original sentence on error
         ok = preserves_numbers(s, y) and within_len_bounds(s, y, lo=0.75, hi=1.35)
         outs.append(y if ok else s)
     return " ".join(outs)
 
 def paraphrase_bart_sentencewise(bart_pipe, text: str) -> str:
-    """BART paraphrase per sentence; a bit more room than PEGASUS."""
+    """BART paraphrase per sentence."""
     outs: List[str] = []
     for s in sent_split(text):
         try:
             y = bart_pipe(
                 f"paraphrase: {s}",
                 do_sample=True,
-                num_beams=1,        # ← important
+                num_beams=1,
                 top_p=0.92,
                 top_k=60,
                 temperature=0.95,
@@ -141,13 +137,17 @@ def paraphrase_bart_sentencewise(bart_pipe, text: str) -> str:
                 truncation=True,
             )[0]["generated_text"].strip()
         except Exception:
-           y = re.sub(r'^\s*(?:paraphrase\s*[:\-–—]\s*)+', '', y, flags=re.I)
+            y = s  # fallback to original sentence on error
+        
+        # remove "paraphrase:" prefix
+        y = re.sub(r'^\s*(?:paraphrase\s*[:\-–—]\s*)+', '', y, flags=re.I).strip()
+        
         ok = preserves_numbers(s, y) and within_len_bounds(s, y, lo=0.6, hi=1.6)
         outs.append(y if ok else s)
     return " ".join(outs)
 
 def rewrite_flan(flan_pipe, text: str) -> str:
-    """FLAN rewriter per sentence with instruction for fluency + paraphrase."""
+    """FLAN rewriter per sentence with prompt."""
     outs: List[str] = []
     for s in sent_split(text):
         prompt = (
@@ -156,15 +156,19 @@ def rewrite_flan(flan_pipe, text: str) -> str:
             "Output only the rewritten sentence; no explanations.\n\n"
             f"Sentence: {s}\nParaphrase:"
         )
-        y = flan_pipe(
-            prompt,
-            do_sample=True, top_p=0.92,
-            num_beams=1,
-            no_repeat_ngram_size=3,
-            max_new_tokens=min(192, max(48, int(len(s) * 1.6))),
-            length_penalty=1.05,
-            truncation=True,
-        )[0]["generated_text"].strip()
+        try:
+            y = flan_pipe(
+                prompt,
+                do_sample=True, top_p=0.92,
+                num_beams=1,
+                no_repeat_ngram_size=3,
+                max_new_tokens=min(192, max(48, int(len(s) * 1.6))),
+                length_penalty=1.05,
+                truncation=True,
+            )[0]["generated_text"].strip()
+        except Exception:
+            y = s  # fallback to original sentence on error
+        
         y = re.sub(r"^\s*(Paraphrase:|Output:)\s*", "", y, flags=re.I).strip()
         outs.append(y if preserves_numbers(s, y) else s)
     return " ".join(outs)
@@ -174,7 +178,7 @@ def pipeline_A(models: ModelBundle, text: str) -> str:
     """LT -> T5-GEC -> PEGASUS paraphrase (sentence-wise)."""
     x0 = language_tool_fix(models.lt, text)
     x1 = t5_gec(models.gec_pipe, x0)
-    return paraphrase_pegasus_sentencewise(models.peg_pipe, x1)
+    return paraphrase_pegasus_sentencewise(models.pegasus_pipe, x1)
 
 def pipeline_B(models: ModelBundle, text: str) -> str:
     """T5-GEC -> FLAN rewrite (sentence-wise)."""
@@ -242,7 +246,7 @@ if __name__ == "__main__":
 
     out = reconstruct_with_all_pipelines(texts)
 
-    # pretty print (no metrics)
+    # pretty print
     for tid, bundle in out.items():
         print("\n" + "="*80)
         print(tid.upper())
@@ -255,7 +259,7 @@ if __name__ == "__main__":
             else:
                 print("FAILED:", res.get("error", "Unknown error"))
 
-    # --- auto-save to txt files (short names) ---
+    # --- auto-save to txt files ---
     from pathlib import Path
     outdir = Path("outputs")   # folder will be created automatically
     outdir.mkdir(exist_ok=True)
