@@ -261,7 +261,11 @@ if __name__ == "__main__":
 
     # --- auto-save to txt files ---
     from pathlib import Path
-    outdir = Path("outputs")   # folder will be created automatically
+    # get path of current script
+    project_root = Path(__file__).resolve().parent
+
+    # place outputs inside nlp_project/outputs
+    outdir = project_root / "outputs"
     outdir.mkdir(exist_ok=True)
 
     # 1) save GEC reference per text as textN_gec.txt

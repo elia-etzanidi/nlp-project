@@ -1,0 +1,1 @@
+# Cosine similarity vs reference (lower = larger shift): A\ni	0.8255\nmessage	0.8443\nfor	0.8458\nyou	0.8517\nprofessor	0.8600\nto	0.8616\nas	0.8651\nthe	0.8674\nof	0.8755\n
