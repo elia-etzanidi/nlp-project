@@ -202,7 +202,7 @@ def run_txt_analysis(args):
     # Summary statistics
     print("\n=== Summary statistics ===")
     for label, df in [("A", sim_A), ("B", sim_B), ("C", sim_C)]:
-        print(f"System {label}: {len(df)} shared words with reference.")
+        print(f"Pipeline {label}: {len(df)} shared words with reference.")
         print(f"  Mean cosine: {df['cosine_to_ref'].mean():.4f}")
         print(f"  Median cosine: {df['cosine_to_ref'].median():.4f}")
 
@@ -251,7 +251,7 @@ def run_sen_analysis(args):
 
     # Summary statistics
     print("\n=== Summary statistics ===")
-    for label, df in [("Sent1", sim_sent1), ("Sent2", sim_sent2)]:
+    for label, df in [("Sentence 1", sim_sent1), ("Sentence 2", sim_sent2)]:
         print(f"{label}: {len(df)} shared words between original and reconstructed.")
         if len(df) > 0:
             print(f"  Mean cosine: {df['cosine_to_ref'].mean():.4f}")
