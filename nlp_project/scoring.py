@@ -2,11 +2,6 @@
 Phase 1 scoring.
 
 Reads reconstruction outputs from .txt files.
-
-Required filenames in the input directory:
-  textN_gec.txt
-  textN_pipeB.txt
-  textN_pipeC.txt
 """
 
 from __future__ import annotations
