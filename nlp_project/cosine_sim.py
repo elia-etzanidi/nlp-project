@@ -12,7 +12,7 @@ cd into nlp_project and run:
 
 TXT Mode:
 TEXT 1) python cosine_sim.py txt --ref outputs/text1_gec.txt --sysA outputs/text1_pipeA.txt --sysB outputs/text1_pipeB.txt --sysC outputs/text1_pipeC.txt --outdir results/text1/
-TEXT 2) python cosine_sim.py txt --ref outputs/text1_gec.txt --sysA outputs/text1_pipeA.txt --sysB outputs/text1_pipeB.txt --sysC outputs/text1_pipeC.txt --outdir results/text1/
+TEXT 2) python cosine_sim.py txt --ref outputs/text2_gec.txt --sysA outputs/text2_pipeA.txt --sysB outputs/text2_pipeB.txt --sysC outputs/text2_pipeC.txt --outdir results/text2/
 
 SEN Mode:
 python cosine_sim.py sen --sent1_og outputs/sent1_og.txt --sent1_out outputs/sent1_out.txt --sent2_og outputs/sent2_og.txt --sent2_out outputs/sent2_out.txt --outdir results/
