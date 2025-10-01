@@ -1,5 +1,5 @@
 # nlp-project
-university project for natural language processing class
+university project for natural language processing
 
 ## Description
 A text reconstruction toolkit combining **Grammatical Error Correction (GEC)** and **sentence-level paraphrasing (seq2seq models)**.  
